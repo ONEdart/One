@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>One - Secure File Storage</title>
+  
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    // Tailwind configuration
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            slate: {
+              50: '#f8fafc',
+              100: '#f1f5f9',
+              200: '#e2e8f0',
+              300: '#cbd5e1',
+              400: '#94a3b8',
+              500: '#64748b',
+              600: '#475569',
+              700: '#334155',
+              800: '#1e293b',
+              900: '#0f172a',
+            }
+          }
+        }
+      }
+    }
+  </script>
+  
+  <!-- Font Awesome Icons -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  
+  <!-- Fix for blocked storage in browsers -->
+  <script>
+    (function() {
+      // Create memory storage fallback for when localStorage/sessionStorage is blocked
+      const memoryStorage = {
+        data: {},
+        setItem: function(key, value) {
+          this.data[key] = String(value);
+        },
+        getItem: function(key) {
+          return this.data[key] || null;
+        },
+        removeItem: function(key) {
+          delete this.data[key];
+        },
+        clear: function() {
+          this.data = {};
+        },
+        key: function(index) {
+          return Object.keys(this.data)[index] || null;
+        },
+        get length() {
+          return Object.keys(this.data).length;
+        }
+      };
+      
+      // Test and fix sessionStorage
+      try {
+        // Test if we can access sessionStorage
+        sessionStorage.setItem('test', 'test');
+        sessionStorage.removeItem('test');
+      } catch (e) {
+        console.log('sessionStorage blocked, using memory fallback');
+        // Replace with memory storage
+        window.sessionStorage = Object.create(memoryStorage);
+        sessionStorage.data = {};
+      }
+      
+      // Test and fix localStorage
+      try {
+        // Test if we can access localStorage
+        localStorage.setItem('test', 'test');
+        localStorage.removeItem('test');
+      } catch (e) {
+        console.log('localStorage blocked, using memory fallback');
+        // Replace with memory storage (new instance)
+        window.localStorage = Object.create(memoryStorage);
+        localStorage.data = {};
+      }
+    })();
+  </script>
+  
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      height: 100%;
+      background: white;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+    }
+    
+    /* Smooth transitions */
+    .transition-all {
+      transition-property: all;
+      transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
+      transition-duration: 200ms;
+    }
+    
+    /* Custom scrollbar */
+    ::-webkit-scrollbar {
+      width: 8px;
+      height: 8px;
+    }
+    ::-webkit-scrollbar-track {
+      background: #f1f5f9;
+    }
+    ::-webkit-scrollbar-thumb {
+      background: #cbd5e1;
+      border-radius: 4px;
+    }
+    ::-webkit-scrollbar-thumb:hover {
+      background: #94a3b8;
+    }
+    
+    /* Animation classes */
+    .fade-enter-active, .fade-leave-active {
+      transition: opacity 0.3s ease;
+    }
+    .fade-enter, .fade-leave-to {
+      opacity: 0;
+    }
+    
+    .slide-enter-active, .slide-leave-active {
+      transition: transform 0.3s ease, opacity 0.3s ease;
+    }
+    .slide-enter, .slide-leave-to {
+      transform: translateY(-10px);
+      opacity: 0;
+    }
+    
+    /* Loading spinner animation */
+    @keyframes spin {
+      from { transform: rotate(0deg); }
+      to { transform: rotate(360deg); }
+    }
+    .animate-spin {
+      animation: spin 1s linear infinite;
+    }
+    
+    /* Pulse animation for status indicators */
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.5; }
+    }
+    .animate-pulse {
+      animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+    }
+  </style>
+</head>
+<body class="bg-white">
+  <div id="app"></div>
+  
+  <!-- Vue 3 Production Build -->
+  <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+  <!-- Vue Router -->
+  <script src="https://unpkg.com/vue-router@4/dist/vue-router.global.prod.js"></script>
+  
+  <!-- Load our application -->
+  <script type="module">
+    // Import our modules
+    import App from './js/app.js';
+    import routes from './js/router.js';
+    
+    const { createApp } = Vue;
+    const { createRouter, createWebHashHistory } = VueRouter;
+    
+    // Create router with routes
+    const router = createRouter({
+      history: createWebHashHistory(),
+      routes
+    });
+    
+    // Set page titles and handle auth redirects
+    router.beforeEach((to, from, next) => {
+      // Set document title
+      if (to.meta && to.meta.title) {
+        document.title = `One - ${to.meta.title}`;
+      } else if (to.name) {
+        document.title = `One - ${to.name}`;
+      } else {
+        document.title = 'One - Secure File Storage';
+      }
+      
+      console.log(`Routing: ${from.path} -> ${to.path}`);
+      
+      // Check for Firebase auth (if available)
+      const auth = window.auth || null;
+      const user = auth ? auth.currentUser : null;
+      const requiresAuth = to.matched.some(record => record.meta.requiresAuth);
+      
+      // Auth logic
+      if (requiresAuth && !user) {
+        // Redirect to login if route requires auth but no user
+        console.log('Redirecting to login: Authentication required');
+        next('/login');
+      } else if (!requiresAuth && user && 
+                (to.path === '/login' || to.path === '/signup' || to.path === '/forgot-password')) {
+        // Redirect to drive if user is already logged in and tries to access auth pages
+        console.log('Redirecting to drive: User already authenticated');
+        next('/drive');
+      } else {
+        // Continue navigation
+        next();
+      }
+    });
+    
+    // Create and mount the app
+    const app = createApp(App);
+    app.use(router);
+    app.mount('#app');
+    
+    // Make auth globally available for debugging (optional)
+    if (typeof window !== 'undefined') {
+      import('./firebaseConfig.js').then(({ auth }) => {
+        window.auth = auth;
+        
+        // Monitor auth state changes
+        auth.onAuthStateChanged((user) => {
+          if (user) {
+            console.log('User authenticated:', user.email);
+          } else {
+            console.log('User signed out');
+          }
+        });
+      }).catch(err => {
+        console.log('Firebase not loaded yet:', err.message);
+      });
+    }
+    
+    console.log('✅ One app loaded successfully!');
+  </script>
+</body>
+</html>
