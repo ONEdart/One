@@ -5,12 +5,18 @@ import {
     query, where, serverTimestamp, writeBatch 
 } from '../../../firebaseConfig.js';
 
-// Library encoding – diambil dari global (window)
+// Global libraries (diasumsikan sudah dimuat lewat <script> di index.html)
 const pako = window.pako;
 const base32 = window.base32;
 const base85 = window.base85;
 const base91 = window.base91;
 
+/**
+ * DriveManager – Real GitHub‑based stealth storage.
+ * - Menyimpan potongan file sebagai kode di 150 repo publik.
+ * - Metadata di Firestore per user.
+ * - Enkripsi AES‑256‑GCM + kompresi zlib + encoding acak.
+ */
 export default class DriveManager {
     constructor() {
         this.user = null;
@@ -21,11 +27,11 @@ export default class DriveManager {
         this.auth = auth;
         this.initialized = false;
         this.initPromise = this._init();
-        this.maxConcurrentUploads = 5; // batasi konkurensi upload
+        this.maxConcurrentUploads = 5;
     }
 
     // ----------------------------------------------------------------------
-    // Initialisation
+    // Inisialisasi
     // ----------------------------------------------------------------------
     async _init() {
         return new Promise((resolve) => {
@@ -128,7 +134,7 @@ export default class DriveManager {
     }
 
     // ----------------------------------------------------------------------
-    // Folder / file metadata operations (Firestore)
+    // Operasi Folder / File (Firestore)
     // ----------------------------------------------------------------------
     async getFolderContents(folderId, includeTrash = false) {
         await this.initPromise;
@@ -206,7 +212,7 @@ export default class DriveManager {
     }
 
     // ----------------------------------------------------------------------
-    // Upload logic (diperbaiki)
+    // Upload (dengan enkripsi, kompresi, encoding, dan distribusi ke GitHub)
     // ----------------------------------------------------------------------
     async uploadFiles(files, targetFolderId) {
         await this.initPromise;
@@ -242,26 +248,16 @@ export default class DriveManager {
 
         const CHUNK_SIZE = 750 * 1024;
         const numChunks = Math.ceil(totalSize / CHUNK_SIZE);
-        const chunks = [];
+        const chunkPromises = [];
 
-        const uploadPromises = [];
         for (let i = 0; i < numChunks; i++) {
             const start = i * CHUNK_SIZE;
             const end = Math.min(start + CHUNK_SIZE, totalSize);
             const chunkData = fileData.slice(start, end);
-
-            const promise = this._processAndUploadChunk(chunkData, i, key)
-                .then(chunkInfo => {
-                    chunks[i] = chunkInfo;
-                });
-            uploadPromises.push(promise);
+            chunkPromises.push(this._processAndUploadChunk(chunkData, i, key));
         }
 
-        await this._runWithConcurrency(uploadPromises, this.maxConcurrentUploads);
-
-        if (chunks.length !== numChunks || chunks.some(c => !c)) {
-            throw new Error('Some chunks failed to upload');
-        }
+        const chunks = await this._runWithConcurrency(chunkPromises, this.maxConcurrentUploads);
 
         const fileDoc = {
             type: 'file',
@@ -303,12 +299,18 @@ export default class DriveManager {
         const repoName = this._selectRepo();
         const category = this.repoCategories[repoName] || 'web';
         const template = this._getTemplate(category);
-        let path = this._generatePath(category, index);
+        const basePath = this._generatePath(category, index);
 
         const content = template.replace('{encoded_data}', doubleEncoded);
-        const success = await this._uploadToGithubWithRetry(repoName, path, content, index);
+        const { success, finalPath } = await this._uploadToGithubWithRetry(repoName, basePath, content, index);
         if (!success) {
-            throw new Error(`Failed to upload chunk ${index} to ${repoName}`);
+            throw new Error(`Failed to upload chunk ${index} to ${repoName} after multiple attempts`);
+        }
+
+        const verifyUrl = `https://raw.githubusercontent.com/696963/${repoName}/main/${finalPath}`;
+        const headResponse = await fetch(verifyUrl, { method: 'HEAD' });
+        if (!headResponse.ok) {
+            throw new Error(`Chunk ${finalPath} tidak dapat diverifikasi setelah upload (${headResponse.status})`);
         }
 
         const hashBuffer = await crypto.subtle.digest('SHA-256', chunkData);
@@ -317,7 +319,7 @@ export default class DriveManager {
 
         return {
             repo: repoName,
-            path: path,
+            path: finalPath,
             index: index,
             hash: hashHex,
             iv: btoa(String.fromCharCode(...iv)),
@@ -334,12 +336,18 @@ export default class DriveManager {
         while (attempt < maxRetries) {
             try {
                 const result = await this._githubCreateFile(repo, currentPath, content, `Add chunk ${chunkIndex}`);
-                if (result === true) return true;
-
+                if (result === true) {
+                    console.log(`Upload sukses ke ${repo}/${currentPath} setelah attempt ${attempt}`);
+                    return { success: true, finalPath: currentPath };
+                }
+                // conflict (422/409) – generate path baru dengan variasi lebih besar
+                console.warn(`Conflict pada ${repo}/${currentPath}, mencoba path baru (attempt ${attempt+1})`);
                 const category = this.repoCategories[repo] || 'web';
-                currentPath = this._generatePath(category, chunkIndex + attempt * 1000 + Math.floor(Math.random() * 1000));
+                // tambahkan timestamp dan random besar untuk menghindari collision
+                const uniqueSeed = Date.now() + Math.floor(Math.random() * 1000000) + attempt * 10000;
+                currentPath = this._generatePath(category, chunkIndex + uniqueSeed);
                 attempt++;
-                await new Promise(resolve => setTimeout(resolve, 1000 * Math.pow(2, attempt)));
+                await new Promise(resolve => setTimeout(resolve, 1000 * Math.pow(2, attempt))); // exponential backoff
             } catch (error) {
                 if (error.message.includes('403') || error.message.includes('rate limit')) {
                     const wait = 60 * 1000 * Math.pow(2, attempt);
@@ -348,57 +356,40 @@ export default class DriveManager {
                 } else if (error.message.includes('5') || error.message.includes('502') || error.message.includes('503')) {
                     await new Promise(resolve => setTimeout(resolve, 5000 * Math.pow(2, attempt)));
                 } else {
-                    throw error;
+                    throw error; // error lain, tidak bisa di-retry
                 }
                 attempt++;
             }
         }
-        return false;
+        console.error(`Gagal upload chunk ${chunkIndex} ke ${repo} setelah ${maxRetries} percobaan`);
+        return { success: false, finalPath: null };
     }
 
-async _githubCreateFile(repo, path, content, message) {
-    const url = `https://api.github.com/repos/696963/${repo}/contents/${path}`;
-    const contentBase64 = btoa(unescape(encodeURIComponent(content))); // UTF‑8 safe base64
-    const body = { message, content: contentBase64 };
-    const response = await fetch(url, {
-        method: 'PUT',
-        headers: {
-            'Authorization': `token ${this.githubToken}`,
-            'Accept': 'application/vnd.github.v3+json',
-            'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(body)
-    });
-    if (!response.ok) {
-        const error = await response.json();
-        // 422 (Unprocessable Entity) atau 409 (Conflict) berarti file sudah ada
-        if (response.status === 422 || response.status === 409) {
-            return false; // konflik → perlu retry dengan path baru
-        }
-        throw new Error(`GitHub API error (${repo}): ${error.message} (status ${response.status})`);
-    }
-    return true;
-}
-
-    async _runWithConcurrency(promises, limit) {
-        const results = [];
-        const executing = new Set();
-        for (const promise of promises) {
-            const p = promise.then(result => {
-                executing.delete(p);
-                return result;
-            });
-            results.push(p);
-            executing.add(p);
-            if (executing.size >= limit) {
-                await Promise.race(executing);
+    async _githubCreateFile(repo, path, content, message) {
+        const url = `https://api.github.com/repos/696963/${repo}/contents/${path}`;
+        const contentBase64 = btoa(unescape(encodeURIComponent(content))); // UTF‑8 safe base64
+        const body = { message, content: contentBase64 };
+        const response = await fetch(url, {
+            method: 'PUT',
+            headers: {
+                'Authorization': `token ${this.githubToken}`,
+                'Accept': 'application/vnd.github.v3+json',
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(body)
+        });
+        if (!response.ok) {
+            const error = await response.json();
+            if (response.status === 422 || response.status === 409) {
+                return false; // konflik → perlu retry dengan path baru
             }
+            throw new Error(`GitHub API error (${repo}): ${error.message} (status ${response.status})`);
         }
-        return Promise.all(results);
+        return true;
     }
 
     // ----------------------------------------------------------------------
-    // Download logic (diperbaiki)
+    // Download (menggabungkan chunk, dekripsi, dekompresi)
     // ----------------------------------------------------------------------
     async downloadFiles(fileIds) {
         await this.initPromise;
@@ -450,7 +441,15 @@ async _githubCreateFile(repo, path, content, message) {
             throw new Error('No encoded data found in the GitHub file');
         }
 
-        const encoded = atob(doubleEncoded);
+        // Validasi dan decode doubleEncoded
+        let encoded;
+        try {
+            encoded = atob(doubleEncoded);
+        } catch (e) {
+            console.error('Invalid base64 string:', doubleEncoded.substring(0, 100));
+            throw new Error('Corrupted chunk data: invalid base64');
+        }
+
         const ciphertext = this._decodeData(encoded, chunk.encoding);
 
         const iv = Uint8Array.from(atob(chunk.iv), c => c.charCodeAt(0));
@@ -477,15 +476,28 @@ async _githubCreateFile(repo, path, content, message) {
     }
 
     _extractDoubleEncoded(text) {
+        // Cari string dalam kutip ganda atau tunggal
         const doubleQuoted = text.match(/"((?:[^"\\]|\\.)*)"/g) || [];
         const singleQuoted = text.match(/'((?:[^'\\]|\\.)*)'/g) || [];
         const allQuoted = doubleQuoted.concat(singleQuoted);
 
         if (allQuoted.length > 0) {
+            // Ambil yang terpanjang
             const longest = allQuoted.reduce((a, b) => a.length > b.length ? a : b, '');
-            return longest.slice(1, -1);
+            // Hapus tanda kutip pertama dan terakhir
+            const quotedContent = longest.slice(1, -1);
+            // Unescape karakter escape JavaScript (misal \n, \", \\)
+            try {
+                // JSON.parse akan menginterpretasi escape sequences dengan benar
+                return JSON.parse('"' + quotedContent + '"');
+            } catch (e) {
+                console.warn('JSON parse failed, falling back to manual unescape', e);
+                // Fallback sederhana: ganti backslash + sesuatu dengan sesuatu (tidak sempurna)
+                return quotedContent.replace(/\\(.)/g, '$1');
+            }
         }
 
+        // Fallback: cari rangkaian base64 panjang
         const base64Matches = text.match(/[A-Za-z0-9+/=]{50,}/g);
         if (base64Matches && base64Matches.length > 0) {
             return base64Matches.reduce((a, b) => a.length > b.length ? a : b, '');
@@ -516,7 +528,7 @@ async _githubCreateFile(repo, path, content, message) {
     }
 
     // ----------------------------------------------------------------------
-    // Encoding utilities (tetap sama, hanya fallback)
+    // Encoding utilities (dengan fallback ke base64 jika library tidak ada)
     // ----------------------------------------------------------------------
     _randomEncoding() {
         const available = ['base64'];
@@ -526,64 +538,57 @@ async _githubCreateFile(repo, path, content, message) {
         return available[Math.floor(Math.random() * available.length)];
     }
 
-_encodeData(data, encoding) {
-    const uint8 = new Uint8Array(data);
+    _encodeData(data, encoding) {
+        const uint8 = new Uint8Array(data);
 
-    // Helper aman: konversi Uint8Array ke binary string tanpa spread
-    const toBinaryString = (arr) => {
-        let binary = '';
-        for (let i = 0; i < arr.length; i++) {
-            binary += String.fromCharCode(arr[i]);
-        }
-        return binary;
-    };
-
-    if (encoding === 'base64') {
-        return btoa(toBinaryString(uint8));
-    }
-
-    if (encoding === 'base32') {
-        if (typeof base32 !== 'undefined' && base32.Encoder) {
-            try {
-                const encoder = new base32.Encoder();
-                return encoder.write(uint8).finalize();
-            } catch (e) {
-                console.warn('base32 encoding failed, falling back to base64', e);
+        const toBinaryString = (arr) => {
+            let binary = '';
+            for (let i = 0; i < arr.length; i++) {
+                binary += String.fromCharCode(arr[i]);
             }
-        } else {
-            console.warn('base32 library not available, falling back to base64');
-        }
-        return btoa(toBinaryString(uint8));
-    }
+            return binary;
+        };
 
-    if (encoding === 'base85') {
-        if (typeof base85 !== 'undefined' && base85.encode) {
-            try {
-                return base85.encode(uint8);
-            } catch (e) {
-                console.warn('base85 encoding failed, falling back to base64', e);
+        if (encoding === 'base64') {
+            return btoa(toBinaryString(uint8));
+        }
+
+        if (encoding === 'base32') {
+            if (typeof base32 !== 'undefined' && base32.Encoder) {
+                try {
+                    const encoder = new base32.Encoder();
+                    return encoder.write(uint8).finalize();
+                } catch (e) {
+                    console.warn('base32 encoding failed, falling back to base64', e);
+                }
             }
-        } else {
-            console.warn('base85 library not available, falling back to base64');
+            return btoa(toBinaryString(uint8));
         }
-        return btoa(toBinaryString(uint8));
-    }
 
-    if (encoding === 'base91') {
-        if (typeof base91 !== 'undefined' && base91.encode) {
-            try {
-                return base91.encode(uint8);
-            } catch (e) {
-                console.warn('base91 encoding failed, falling back to base64', e);
+        if (encoding === 'base85') {
+            if (typeof base85 !== 'undefined' && base85.encode) {
+                try {
+                    return base85.encode(uint8);
+                } catch (e) {
+                    console.warn('base85 encoding failed, falling back to base64', e);
+                }
             }
-        } else {
-            console.warn('base91 library not available, falling back to base64');
+            return btoa(toBinaryString(uint8));
         }
+
+        if (encoding === 'base91') {
+            if (typeof base91 !== 'undefined' && base91.encode) {
+                try {
+                    return base91.encode(uint8);
+                } catch (e) {
+                    console.warn('base91 encoding failed, falling back to base64', e);
+                }
+            }
+            return btoa(toBinaryString(uint8));
+        }
+
         return btoa(toBinaryString(uint8));
     }
-
-    return btoa(toBinaryString(uint8));
-}
 
     _decodeData(encodedStr, encoding) {
         if (encoding === 'base64') {
@@ -615,6 +620,7 @@ _encodeData(data, encoding) {
                 console.warn('base91 decoding failed, trying base64 fallback', e);
             }
         }
+        // Fallback base64
         const binary = atob(encodedStr);
         const len = binary.length;
         const bytes = new Uint8Array(len);
@@ -622,6 +628,9 @@ _encodeData(data, encoding) {
         return bytes;
     }
 
+    // ----------------------------------------------------------------------
+    // Pemilihan repo, template, path (agar terlihat seperti proyek nyata)
+    // ----------------------------------------------------------------------
     _selectRepo() {
         return this.repos[Math.floor(Math.random() * this.repos.length)];
     }
@@ -704,7 +713,7 @@ _encodeData(data, encoding) {
     }
 
     // ----------------------------------------------------------------------
-    // Other operations (move, delete, star, stats)
+    // Operasi lain: hapus, pindah, bintang, statistik
     // ----------------------------------------------------------------------
     async deleteItems(itemIds, moveToTrash = true) {
         await this.initPromise;
@@ -782,5 +791,26 @@ _encodeData(data, encoding) {
         if (mime.startsWith('text/')) return ['text'];
         if (mime === 'application/pdf') return ['pdf'];
         return ['binary'];
+    }
+
+    async _runWithConcurrency(promises, limit) {
+        const results = new Array(promises.length);
+        const executing = new Set();
+
+        for (let i = 0; i < promises.length; i++) {
+            const p = promises[i].then(result => {
+                results[i] = result;
+                executing.delete(p);
+            }).catch(err => {
+                executing.delete(p);
+                throw err;
+            });
+            executing.add(p);
+            if (executing.size >= limit) {
+                await Promise.race(executing);
+            }
+        }
+        await Promise.all(executing);
+        return results;
     }
 }
