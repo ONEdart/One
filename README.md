@@ -1,7 +1,6 @@
 ```
 one/
 ├─ index.html
-├─ firebaseConfig.js
 ├─ css/
 │  └─ tailwind.css
 ├─ js/
@@ -15,7 +14,12 @@ one/
 │  │  ├─ PublicDrive.js
 │  │  ├─ Profile.js
 │  │  └─ NotFound.js
-│  └─ logic/
-│     └─ DriveManager.js
+│  └─ components/
+│     ├─ TopBar.js
+│     ├─ Breadcrumb.js
+│     ├─ FileGrid.js
+│     ├─ FileItem.js
+│     ├─ UploadModal.js
+│     └─ Button.js
 └─ README.md
 ```

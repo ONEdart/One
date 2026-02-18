@@ -1,8 +1,6 @@
 // firebaseConfig.js
 
-// Import Firebase dari CDN
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js";
-import { getAnalytics } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-analytics.js";
 import { 
   getAuth, 
   signInWithEmailAndPassword,
@@ -16,7 +14,10 @@ import {
   onAuthStateChanged,
   sendPasswordResetEmail,
   createUserWithEmailAndPassword,
-  updateProfile
+  updateProfile,
+  EmailAuthProvider,
+  reauthenticateWithCredential,
+  updatePassword
 } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-auth.js";
 import { 
   getFirestore,
@@ -26,12 +27,14 @@ import {
   query,
   where,
   orderBy,
+  limit,                 // <-- TAMBAHKAN
   serverTimestamp,
   doc,
   setDoc,
   getDoc,
   updateDoc,
-  deleteDoc
+  deleteDoc,
+  writeBatch
 } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js";
 import { 
   getStorage,
@@ -42,7 +45,6 @@ import {
   listAll
 } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-storage.js";
 
-// Your Firebase configuration
 const firebaseConfig = {
   apiKey: "AIzaSyAX0sn-fh9bynPShGTpOd1-Y4XfeLmk26k",
   authDomain: "pakelstorage.firebaseapp.com",
@@ -54,22 +56,13 @@ const firebaseConfig = {
   measurementId: "G-F251GQQNYR"
 };
 
-// Initialize Firebase
 const app = initializeApp(firebaseConfig);
-const analytics = getAnalytics(app);
-
-// Initialize services
 const auth = getAuth(app);
 const db = getFirestore(app);
 const storage = getStorage(app);
 
-// Export semua yang diperlukan
 export {
-  // App & Analytics
   app,
-  analytics,
-  
-  // Auth
   auth,
   signInWithEmailAndPassword,
   signInWithPopup,
@@ -83,8 +76,9 @@ export {
   sendPasswordResetEmail,
   createUserWithEmailAndPassword,
   updateProfile,
-  
-  // Firestore
+  EmailAuthProvider,
+  reauthenticateWithCredential,
+  updatePassword,
   db,
   collection,
   addDoc,
@@ -92,14 +86,14 @@ export {
   query,
   where,
   orderBy,
+  limit,                 // <-- EKSPOR
   serverTimestamp,
   doc,
   setDoc,
   getDoc,
   updateDoc,
   deleteDoc,
-  
-  // Storage
+  writeBatch,
   storage,
   ref,
   uploadBytes,

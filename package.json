@@ -1,0 +1,19 @@
+{
+  "name": "one",
+  "version": "1.0.0",
+  "description": "```\r one/\r ├─ index.html\r ├─ css/\r │  └─ tailwind.css\r ├─ js/\r │  ├─ app.js\r │  ├─ router.js\r │  ├─ pages/\r │  │  ├─ Login.js\r │  │  ├─ SignUp.js\r │  │  ├─ ForgotPassword.js\r │  │  ├─ Drive.js\r │  │  ├─ PublicDrive.js\r │  │  ├─ Profile.js\r │  │  └─ NotFound.js\r │  └─ components/\r │     ├─ TopBar.js\r │     ├─ Breadcrumb.js\r │     ├─ FileGrid.js\r │     ├─ FileItem.js\r │     ├─ UploadModal.js\r │     └─ Button.js\r └─ README.md\r ```",
+  "main": "firebaseConfig.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node server.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "base32.js": "^0.1.0",
+    "base85": "^3.2.0",
+    "firebase": "^12.9.0",
+    "pako": "^2.1.0"
+  }
+}
