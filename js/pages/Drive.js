@@ -35,7 +35,8 @@ export default {
       items: [],
       storageStats: null,
       isLoading: true,
-      progressIntervals: [] // untuk membersihkan interval upload simulasi
+      progressIntervals: [], // untuk membersihkan interval upload simulasi
+      operationLoading: false, // untuk loading state saat operasi seperti delete/move
     }
   },
   
@@ -70,6 +71,7 @@ export default {
           item.type.toLowerCase().includes(query)
         )
       }
+      // Urutkan: folder dulu, lalu file, lalu berdasarkan nama
       return items.sort((a, b) => {
         if (a.type === 'folder' && b.type !== 'folder') return -1
         if (a.type !== 'folder' && b.type === 'folder') return 1
@@ -137,18 +139,20 @@ export default {
   },
   
   methods: {
-    // ===================== INITIALIZATION =====================
+    // ===================== INISIALISASI =====================
     async initDriveManager() {
       try {
         this.isLoading = true
         this.driveManager = new DriveManager()
+        // Tunggu inisialisasi internal DriveManager (auth, dll) jika diperlukan
+        await this.driveManager.initPromise
         await this.loadFolderContents()
         await this.updateCurrentFolderInfo()
         this.storageStats = this.driveManager.getStats()
-        this.isLoading = false
-        // Auto-save tidak perlu karena Firestore langsung tersimpan
       } catch (error) {
-        console.error('Failed to initialize DriveManager:', error)
+        console.error('Gagal menginisialisasi DriveManager:', error)
+        this.showNotification('Gagal memuat drive. Silakan refresh halaman.', 'error')
+      } finally {
         this.isLoading = false
       }
     },
@@ -159,29 +163,39 @@ export default {
         this.folderPath = []
         return
       }
-      const folder = await this.driveManager.getFolderInfo(this.currentFolderId)
-      this.currentFolderData = folder
-      await this.buildFolderPath(this.currentFolderId)
+      try {
+        const folder = await this.driveManager.getFolderInfo(this.currentFolderId)
+        this.currentFolderData = folder
+        await this.buildFolderPath(this.currentFolderId)
+      } catch (error) {
+        console.error('Gagal mengambil info folder:', error)
+        this.showNotification('Gagal memuat informasi folder', 'error')
+      }
     },
     
     async buildFolderPath(folderId) {
       const path = []
       let currentId = folderId
       while (currentId && currentId !== 'root') {
-        const folder = await this.driveManager.getFolderInfo(currentId)
-        if (!folder) break
-        path.unshift(folder)
-        currentId = folder.parentId
+        try {
+          const folder = await this.driveManager.getFolderInfo(currentId)
+          if (!folder) break
+          path.unshift(folder)
+          currentId = folder.parentId
+        } catch (error) {
+          console.error('Gagal membangun path folder:', error)
+          break
+        }
       }
       this.folderPath = path
     },
     
-    // ===================== DATA LOADING =====================
+    // ===================== MEMUAT DATA =====================
     async loadFolderContents() {
       if (!this.driveManager) return
       try {
         const contents = await this.driveManager.getFolderContents(this.currentFolderId, false)
-        if (contents.success === false) {
+        if (!contents.success) {
           console.error('Error loading folder contents:', contents.error)
           this.items = []
           return
@@ -191,8 +205,9 @@ export default {
           ...(contents.files || []).map(file => this.formatFileForUI(file))
         ]
       } catch (error) {
-        console.error('Error in loadFolderContents:', error)
+        console.error('Error di loadFolderContents:', error)
         this.items = []
+        this.showNotification('Gagal memuat konten folder', 'error')
       }
     },
     
@@ -201,13 +216,13 @@ export default {
         id: folder.id,
         name: folder.name,
         type: 'folder',
-        size: this.formatBytes(folder.metadata?.size || 0),
-        date: new Date(folder.createdAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }),
-        items: folder.metadata?.items || 0,
-        color: folder.metadata?.color || 'blue',
+        size: this.formatBytes(0), // folder tidak punya ukuran
+        date: folder.createdAt ? new Date(folder.createdAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : '',
+        items: folder.items || 0,
+        color: folder.color || 'blue',
         parentId: folder.parentId,
         createdAt: folder.createdAt,
-        metadata: folder.metadata
+        starred: folder.starred || false,
       }
     },
     
@@ -215,13 +230,13 @@ export default {
       return {
         id: file.id,
         name: file.name,
-        type: file.type,
-        size: this.formatBytes(file.size || 0),
-        date: new Date(file.createdAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }),
+        type: this.getFileTypeFromName(file.name), // dari nama file, bukan mimeType
+        size: file.size || 0,
+        date: file.createdAt ? new Date(file.createdAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : '',
         starred: file.starred || false,
         parentId: file.parentId,
         createdAt: file.createdAt,
-        metadata: file.metadata
+        mimeType: file.mimeType,
       }
     },
     
@@ -244,7 +259,7 @@ export default {
       this.navigateToFolder('root')
     },
     
-    // ===================== ITEM CLICK HANDLING =====================
+    // ===================== KLIK ITEM =====================
     handleItemClick(item, event) {
       this.clickCount++
       if (this.clickCount === 1) {
@@ -353,11 +368,9 @@ export default {
     },
     
     showFilePreview(file) {
+      // Gunakan modal sederhana, atau bisa pakai komponen terpisah
       const modal = document.createElement('div')
       modal.className = 'fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center p-4 z-50'
-      
-      // Ambil info file dari DriveManager (opsional)
-      // const fileInfo = await this.driveManager.getFileInfo(file.id) // tidak bisa await di sini, jadi kita pakai data yang ada
       
       modal.innerHTML = `
         <div class="bg-white border border-slate-300 rounded-2xl p-6 max-w-md w-full shadow-2xl">
@@ -381,7 +394,7 @@ export default {
             </div>
             <div class="flex-1 min-w-0">
               <div class="font-semibold text-slate-900 truncate">${file.name}</div>
-              <div class="text-sm text-slate-600">${file.size} • ${file.date}</div>
+              <div class="text-sm text-slate-600">${this.formatBytes(file.size)} • ${file.date}</div>
               <div class="text-xs text-slate-500 mt-1">Distributed across GitHub repositories</div>
             </div>
           </div>
@@ -401,10 +414,14 @@ export default {
       // Simpan referensi ke instance Vue untuk digunakan di window.downloadFile
       const self = this
       window.downloadFile = async (fileId) => {
-        const result = await self.downloadFiles([fileId])
-        if (result.success) {
-          modal.remove()
-          self.showNotification(`Downloading ${result.files.length} file(s)`)
+        try {
+          const result = await self.downloadFiles([fileId])
+          if (result.success) {
+            modal.remove()
+            self.showNotification(`Downloading ${result.files.length} file(s)`)
+          }
+        } catch (error) {
+          self.showNotification('Download gagal: ' + error.message, 'error')
         }
       }
     },
@@ -412,40 +429,62 @@ export default {
     async toggleStar(itemId) {
       const item = this.items.find(f => f.id === itemId)
       if (item && item.type !== 'folder') {
-        await this.driveManager.toggleStar(itemId)
-        await this.loadFolderContents()
+        try {
+          await this.driveManager.toggleStar(itemId)
+          await this.loadFolderContents()
+        } catch (error) {
+          console.error('Gagal toggle star:', error)
+          this.showNotification('Gagal mengubah status bintang', 'error')
+        }
       }
     },
     
-    // ===================== FOLDER OPERATIONS =====================
+    // ===================== OPERASI FOLDER =====================
     async createNewFolder() {
       if (!this.newFolderName.trim()) return
-      const result = await this.driveManager.createFolder(
-        this.newFolderName.trim(),
-        this.currentFolderId,
-        { color: ['blue', 'green', 'purple', 'yellow', 'pink', 'indigo', 'teal'][Math.floor(Math.random() * 7)] }
-      )
-      if (result.success) {
-        this.newFolderName = ''
-        this.showNewFolderModal = false
-        await this.loadFolderContents()
-        this.showNotification(`Folder "${result.folder.name}" created`)
-      } else {
-        this.showNotification(result.error, 'error')
+      try {
+        this.operationLoading = true
+        const result = await this.driveManager.createFolder(
+          this.newFolderName.trim(),
+          this.currentFolderId,
+          { color: ['blue', 'green', 'purple', 'yellow', 'pink', 'indigo', 'teal'][Math.floor(Math.random() * 7)] }
+        )
+        if (result.success) {
+          this.newFolderName = ''
+          this.showNewFolderModal = false
+          await this.loadFolderContents()
+          this.showNotification(`Folder "${result.folder.name}" created`)
+        } else {
+          this.showNotification(result.error, 'error')
+        }
+      } catch (error) {
+        console.error('Gagal membuat folder:', error)
+        this.showNotification('Gagal membuat folder', 'error')
+      } finally {
+        this.operationLoading = false
       }
     },
     
-    // ===================== MOVE OPERATIONS =====================
+    // ===================== MOVE ITEM =====================
     async moveSelectedItems(targetFolderId) {
       const selectedIds = Array.from(this.selectedItems)
-      const result = await this.driveManager.moveItems(selectedIds, targetFolderId)
-      if (result.success) {
-        this.clearSelection()
-        this.showMoveModal = false
-        await this.loadFolderContents()
-        this.showNotification(`${result.movedItems} item(s) moved successfully`)
-      } else if (result.errors && result.errors.length > 0) {
-        this.showNotification(result.errors.join('\n'), 'error')
+      if (selectedIds.length === 0) return
+      try {
+        this.operationLoading = true
+        const result = await this.driveManager.moveItems(selectedIds, targetFolderId)
+        if (result.success) {
+          this.clearSelection()
+          this.showMoveModal = false
+          await this.loadFolderContents()
+          this.showNotification(`${result.movedItems} item(s) moved successfully`)
+        } else if (result.errors && result.errors.length > 0) {
+          this.showNotification(result.errors.join('\n'), 'error')
+        }
+      } catch (error) {
+        console.error('Gagal memindahkan item:', error)
+        this.showNotification('Gagal memindahkan item', 'error')
+      } finally {
+        this.operationLoading = false
       }
     },
     
@@ -466,16 +505,15 @@ export default {
         this.uploadProgress.push(0)
       })
       
-      // Simulasi progress
+      // Simulasi progress (bisa diganti dengan progress callback asli jika diinginkan)
       this.progressIntervals = []
       this.uploadProgress.forEach((_, index) => {
         const interval = setInterval(() => {
-          this.uploadProgress[index] += Math.random() * 20
-          if (this.uploadProgress[index] >= 95) {
-            this.uploadProgress[index] = 95
-            clearInterval(interval)
+          if (this.uploadProgress[index] < 95) {
+            this.uploadProgress[index] += Math.random() * 20
+            if (this.uploadProgress[index] > 95) this.uploadProgress[index] = 95
+            this.uploadProgress = [...this.uploadProgress]
           }
-          this.uploadProgress = [...this.uploadProgress]
         }, 200)
         this.progressIntervals.push(interval)
       })
@@ -493,8 +531,7 @@ export default {
             this.isUploading = false
             await this.loadFolderContents()
             this.showNotification(`${result.files.length} file(s) uploaded`)
-            // Modal akan ditutup manual oleh user atau otomatis setelah beberapa detik?
-            // Biarkan user menekan Done
+            // Biarkan user menekan Done untuk menutup modal
           }, 1000)
         } else {
           this.showNotification(result.error, 'error')
@@ -632,11 +669,16 @@ export default {
     async downloadSelectedFiles() {
       const selectedIds = Array.from(this.selectedItems)
       if (selectedIds.length === 0) return
-      const result = await this.driveManager.downloadFiles(selectedIds)
-      if (result.success) {
-        this.showNotification(`Downloading ${result.files.length} file(s)`)
-      } else {
-        this.showNotification(result.error, 'error')
+      try {
+        const result = await this.driveManager.downloadFiles(selectedIds)
+        if (result.success) {
+          this.showNotification(`Downloading ${result.files.length} file(s)`)
+        } else {
+          this.showNotification(result.error, 'error')
+        }
+      } catch (error) {
+        console.error('Gagal download:', error)
+        this.showNotification('Download gagal: ' + error.message, 'error')
       }
     },
     
@@ -649,18 +691,27 @@ export default {
       const selectedIds = Array.from(this.selectedItems)
       if (selectedIds.length === 0) return
       if (!confirm(`Delete ${selectedIds.length} item(s)?`)) return
-      const result = await this.driveManager.deleteItems(selectedIds, false)
-      if (result.success) {
-        this.clearSelection()
-        await this.loadFolderContents()
-        this.showNotification(`${result.deleted} item(s) moved to trash`)
-      } else {
-        this.showNotification(result.error, 'error')
+      try {
+        this.operationLoading = true
+        const result = await this.driveManager.deleteItems(selectedIds, true) // pindah ke trash
+        if (result.success) {
+          this.clearSelection()
+          await this.loadFolderContents()
+          this.showNotification(`${result.deleted} item(s) moved to trash`)
+        } else {
+          this.showNotification(result.error, 'error')
+        }
+      } catch (error) {
+        console.error('Gagal menghapus:', error)
+        this.showNotification('Gagal menghapus item', 'error')
+      } finally {
+        this.operationLoading = false
       }
     },
     
     // ===================== UTILITY =====================
     getFileTypeFromName(filename) {
+      if (!filename) return 'unknown'
       const extension = filename.split('.').pop().toLowerCase()
       const typeMap = {
         'pdf': 'pdf', 'doc': 'doc', 'docx': 'doc',
@@ -780,8 +831,10 @@ export default {
     },
     
     getSizeColor(size) {
-      if (size.includes('GB') || size.includes('TB')) return 'text-red-600 font-medium'
-      if (size.includes('MB')) return 'text-orange-600 font-medium'
+      if (typeof size === 'string') {
+        if (size.includes('GB') || size.includes('TB')) return 'text-red-600 font-medium'
+        if (size.includes('MB')) return 'text-orange-600 font-medium'
+      }
       return 'text-slate-600 font-medium'
     },
     
@@ -791,7 +844,7 @@ export default {
       return total / this.uploadProgress.length
     },
     
-    // ===================== NOTIFICATION =====================
+    // ===================== NOTIFIKASI =====================
     showNotification(message, type = 'success') {
       const existing = document.querySelector('.drive-notification')
       if (existing) existing.remove()
@@ -807,13 +860,18 @@ export default {
     },
     
     // ===================== STORAGE =====================
-    optimizeStorage() {
-      const result = this.driveManager.optimizeStorage()
-      if (result.success) {
-        this.loadFolderContents()
-        this.showNotification(`Optimization complete: ${result.movedFiles} files moved`)
-      } else {
-        this.showNotification('Optimization failed', 'error')
+    async optimizeStorage() {
+      try {
+        const result = await this.driveManager.optimizeStorage()
+        if (result.success) {
+          await this.loadFolderContents()
+          this.showNotification(`Optimization complete: ${result.movedFiles} files moved`)
+        } else {
+          this.showNotification('Optimization failed', 'error')
+        }
+      } catch (error) {
+        console.error('Gagal optimasi:', error)
+        this.showNotification('Gagal melakukan optimasi', 'error')
       }
     },
     
@@ -874,7 +932,6 @@ export default {
     document.removeEventListener('click', this.handleClickOutside)
     if (this.clickTimer) clearTimeout(this.clickTimer)
     this.progressIntervals.forEach(clearInterval)
-    // Tidak perlu simpan ke localStorage
   },
   
   template: `
@@ -913,7 +970,6 @@ export default {
         <div class="mb-6 p-3 bg-slate-50 border border-slate-300 rounded-lg flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 shadow-sm">
           <div class="flex-1 min-w-0">
             <div class="flex items-center justify-between mb-1">
-              <div class="font-medium text-slate-900">MEGA Federation Storage</div>
               <div class="text-sm font-semibold text-slate-700">{{ storageUsage.used }} / {{ storageUsage.total }}</div>
             </div>
             <div class="h-2 bg-slate-200 rounded-full overflow-hidden">
@@ -1135,7 +1191,7 @@ export default {
                   <div class="text-xs font-semibold px-2 py-1 rounded-full flex-shrink-0" :class="getTypeBadgeColor(item.type)">{{ getTypeDisplay(item.type) }}</div>
                 </div>
                 <div class="flex items-center justify-between text-sm mt-3">
-                  <div class="text-slate-600" :class="getSizeColor(item.size)">{{ item.size }}</div>
+                  <div class="text-slate-600" :class="getSizeColor(item.size)">{{ formatBytes(item.size) }}</div>
                   <div class="text-xs text-slate-400">{{ item.date }}</div>
                 </div>
               </div>
@@ -1188,10 +1244,10 @@ export default {
                     <td class="py-4 px-4 sm:px-6">
                       <div class="min-w-0 flex-1">
                         <div class="font-semibold text-slate-900 truncate">{{ item.name }}</div>
-                        <div class="text-xs text-slate-500">{{ item.type === 'folder' ? getFolderItemCount(item) : item.size }}</div>
+                        <div class="text-xs text-slate-500">{{ item.type === 'folder' ? getFolderItemCount(item) : formatBytes(item.size) }}</div>
                       </div>
                     </td>
-                    <td class="py-4 px-4 sm:px-6 text-sm font-medium" :class="getSizeColor(item.size)">{{ item.size }}</td>
+                    <td class="py-4 px-4 sm:px-6 text-sm font-medium" :class="getSizeColor(item.size)">{{ item.type === 'folder' ? '—' : formatBytes(item.size) }}</td>
                     <td class="py-4 px-4 sm:px-6"><span class="text-xs font-semibold px-3 py-1.5 rounded-full" :class="getTypeBadgeColor(item.type)">{{ getTypeDisplay(item.type) }}</span></td>
                     <td class="py-4 px-4 sm:px-6 text-sm text-slate-700">{{ item.date }}</td>
                     <td class="py-4 px-4 sm:px-6">
@@ -1249,7 +1305,7 @@ export default {
               </div>
               <div v-for="folder in folders.filter(f => !selectedItems.has(f.id) && f.id !== currentFolderId)" :key="folder.id" @click="moveSelectedItems(folder.id)" class="p-3 border border-slate-300 rounded-lg hover:bg-slate-50 cursor-pointer flex items-center space-x-3">
                 <div :class="'w-10 h-10 ' + (fileIconClasses.folder[folder.color] || 'text-blue-600')"><svg class="w-full h-full" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" /></svg></div>
-                <div><div class="font-semibold text-slate-900">{{ folder.name }}</div><div class="text-xs text-slate-500">{{ getFolderItemCount(folder) }} • {{ folder.size }}</div></div>
+                <div><div class="font-semibold text-slate-900">{{ folder.name }}</div><div class="text-xs text-slate-500">{{ getFolderItemCount(folder) }} • {{ formatBytes(folder.size) }}</div></div>
               </div>
             </div>
           </div>
@@ -1271,7 +1327,7 @@ export default {
           </div>
           <div class="flex justify-end space-x-3">
             <button @click="showNewFolderModal = false" class="px-5 py-2.5 border border-slate-300 text-slate-700 text-sm font-semibold rounded-lg hover:bg-slate-50 transition-colors shadow-sm">Cancel</button>
-            <button @click="createNewFolder" :disabled="!newFolderName.trim()" class="px-5 py-2.5 bg-slate-900 text-white text-sm font-semibold rounded-lg hover:bg-slate-800 transition-colors shadow-sm hover:shadow disabled:opacity-50 disabled:cursor-not-allowed">Create Folder</button>
+            <button @click="createNewFolder" :disabled="!newFolderName.trim() || operationLoading" class="px-5 py-2.5 bg-slate-900 text-white text-sm font-semibold rounded-lg hover:bg-slate-800 transition-colors shadow-sm hover:shadow disabled:opacity-50 disabled:cursor-not-allowed">Create Folder</button>
           </div>
         </div>
       </div>

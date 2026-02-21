@@ -11,12 +11,39 @@ const base32 = window.base32;
 const base85 = window.base85;
 const base91 = window.base91;
 
-/**
- * DriveManager – Real GitHub‑based stealth storage.
- * - Menyimpan potongan file sebagai kode di 150 repo publik.
- * - Metadata di Firestore per user.
- * - Enkripsi AES‑256‑GCM + kompresi zlib + encoding acak.
- */
+// ----------------------------------------------------------------------
+// Custom error classes
+// ----------------------------------------------------------------------
+class DriveError extends Error {
+    constructor(message, code = 'DRIVE_ERROR', details = {}) {
+        super(message);
+        this.name = this.constructor.name;
+        this.code = code;
+        this.details = details;
+    }
+}
+
+class TokenError extends DriveError {
+    constructor(message, details = {}) {
+        super(message, 'TOKEN_ERROR', details);
+    }
+}
+
+class GitHubAuthError extends DriveError {
+    constructor(message, status, response) {
+        super(message, 'GITHUB_AUTH_ERROR', { status, response });
+    }
+}
+
+class GitHubApiError extends DriveError {
+    constructor(message, status, response) {
+        super(message, 'GITHUB_API_ERROR', { status, response });
+    }
+}
+
+// ----------------------------------------------------------------------
+// DriveManager
+// ----------------------------------------------------------------------
 export default class DriveManager {
     constructor() {
         this.user = null;
@@ -28,6 +55,7 @@ export default class DriveManager {
         this.initialized = false;
         this.initPromise = this._init();
         this.maxConcurrentUploads = 5;
+        this._validatedRepos = new Set(); // cache repositori yang sudah divalidasi
     }
 
     // ----------------------------------------------------------------------
@@ -134,6 +162,36 @@ export default class DriveManager {
     }
 
     // ----------------------------------------------------------------------
+    // Validasi token GitHub
+    // ----------------------------------------------------------------------
+    async _validateGithubToken() {
+        if (!this.githubToken) {
+            throw new TokenError('Token GitHub tidak ditemukan. Silakan atur token di halaman Profile.');
+        }
+        try {
+            const response = await fetch('https://api.github.com/user', {
+                headers: { 'Authorization': `token ${this.githubToken}` }
+            });
+            if (!response.ok) {
+                const error = await response.json();
+                if (response.status === 401) {
+                    throw new GitHubAuthError('Token GitHub tidak valid atau kedaluwarsa. Perbarui di Profile.', response.status, error);
+                } else {
+                    throw new GitHubApiError(`GitHub API error: ${error.message}`, response.status, error);
+                }
+            }
+            // Cek scope token (opsional) – minimal perlu public_repo
+            const scopes = response.headers.get('X-OAuth-Scopes');
+            if (scopes && !scopes.includes('repo') && !scopes.includes('public_repo')) {
+                console.warn('Token GitHub tidak memiliki scope repo yang memadai. Upload mungkin gagal.');
+            }
+        } catch (error) {
+            if (error instanceof DriveError) throw error;
+            throw new DriveError(`Gagal memvalidasi token GitHub: ${error.message}`, 'TOKEN_VALIDATION_FAILED');
+        }
+    }
+
+    // ----------------------------------------------------------------------
     // Operasi Folder / File (Firestore)
     // ----------------------------------------------------------------------
     async getFolderContents(folderId, includeTrash = false) {
@@ -216,9 +274,8 @@ export default class DriveManager {
     // ----------------------------------------------------------------------
     async uploadFiles(files, targetFolderId) {
         await this.initPromise;
-        if (!this.githubToken) {
-            throw new Error('GitHub token missing – please set it in Profile');
-        }
+        // Validasi token terlebih dahulu
+        await this._validateGithubToken();
 
         const results = [];
         for (const file of files) {
@@ -227,7 +284,12 @@ export default class DriveManager {
                 results.push(result);
             } catch (error) {
                 console.error(`Failed to upload ${file.name}:`, error);
-                throw new Error(`Upload failed for ${file.name}: ${error.message}`);
+                // Lempar error dengan informasi yang jelas
+                if (error instanceof TokenError || error instanceof GitHubAuthError) {
+                    throw error; // biarkan sampai ke UI
+                } else {
+                    throw new DriveError(`Upload gagal untuk ${file.name}: ${error.message}`, 'UPLOAD_FAILED', { fileName: file.name, originalError: error });
+                }
             }
         }
         return { success: true, files: results };
@@ -304,13 +366,13 @@ export default class DriveManager {
         const content = template.replace('{encoded_data}', doubleEncoded);
         const { success, finalPath } = await this._uploadToGithubWithRetry(repoName, basePath, content, index);
         if (!success) {
-            throw new Error(`Failed to upload chunk ${index} to ${repoName} after multiple attempts`);
+            throw new DriveError(`Gagal upload chunk ${index} ke ${repoName} setelah beberapa percobaan`, 'CHUNK_UPLOAD_FAILED');
         }
 
         const verifyUrl = `https://raw.githubusercontent.com/696963/${repoName}/main/${finalPath}`;
         const headResponse = await fetch(verifyUrl, { method: 'HEAD' });
         if (!headResponse.ok) {
-            throw new Error(`Chunk ${finalPath} tidak dapat diverifikasi setelah upload (${headResponse.status})`);
+            throw new DriveError(`Chunk ${finalPath} tidak dapat diverifikasi setelah upload (${headResponse.status})`, 'VERIFICATION_FAILED');
         }
 
         const hashBuffer = await crypto.subtle.digest('SHA-256', chunkData);
@@ -335,7 +397,7 @@ export default class DriveManager {
 
         while (attempt < maxRetries) {
             try {
-                const result = await this._githubCreateFile(repo, currentPath, content, `Add chunk ${chunkIndex}`);
+                const result = await this._githubCreateFile(repo, currentPath, content, `696963k ${chunkIndex}`);
                 if (result === true) {
                     console.log(`Upload sukses ke ${repo}/${currentPath} setelah attempt ${attempt}`);
                     return { success: true, finalPath: currentPath };
@@ -343,18 +405,21 @@ export default class DriveManager {
                 // conflict (422/409) – generate path baru dengan variasi lebih besar
                 console.warn(`Conflict pada ${repo}/${currentPath}, mencoba path baru (attempt ${attempt+1})`);
                 const category = this.repoCategories[repo] || 'web';
-                // tambahkan timestamp dan random besar untuk menghindari collision
                 const uniqueSeed = Date.now() + Math.floor(Math.random() * 1000000) + attempt * 10000;
                 currentPath = this._generatePath(category, chunkIndex + uniqueSeed);
                 attempt++;
-                await new Promise(resolve => setTimeout(resolve, 1000 * Math.pow(2, attempt))); // exponential backoff
+                await this._sleep(1000 * Math.pow(2, attempt) + Math.random() * 1000); // exponential backoff + jitter
             } catch (error) {
+                if (error instanceof GitHubAuthError) {
+                    // Token invalid, tidak perlu retry
+                    throw error;
+                }
                 if (error.message.includes('403') || error.message.includes('rate limit')) {
                     const wait = 60 * 1000 * Math.pow(2, attempt);
                     console.warn(`Rate limit, waiting ${wait}ms before retry`);
-                    await new Promise(resolve => setTimeout(resolve, wait));
+                    await this._sleep(wait);
                 } else if (error.message.includes('5') || error.message.includes('502') || error.message.includes('503')) {
-                    await new Promise(resolve => setTimeout(resolve, 5000 * Math.pow(2, attempt)));
+                    await this._sleep(5000 * Math.pow(2, attempt) + Math.random() * 2000);
                 } else {
                     throw error; // error lain, tidak bisa di-retry
                 }
@@ -380,12 +445,26 @@ export default class DriveManager {
         });
         if (!response.ok) {
             const error = await response.json();
+            if (response.status === 401) {
+                throw new GitHubAuthError(`Token GitHub tidak valid (401) saat mengakses ${repo}`, response.status, error);
+            }
+            if (response.status === 403) {
+                // Mungkin rate limit atau kurang scope
+                if (error.message && error.message.includes('rate limit')) {
+                    throw new Error('rate limit exceeded');
+                }
+                throw new GitHubApiError(`Akses ditolak ke ${repo}. Periksa scope token.`, response.status, error);
+            }
             if (response.status === 422 || response.status === 409) {
                 return false; // konflik → perlu retry dengan path baru
             }
-            throw new Error(`GitHub API error (${repo}): ${error.message} (status ${response.status})`);
+            throw new GitHubApiError(`GitHub API error (${repo}): ${error.message}`, response.status, error);
         }
         return true;
+    }
+
+    _sleep(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
     }
 
     // ----------------------------------------------------------------------
@@ -432,22 +511,21 @@ export default class DriveManager {
         const url = `https://raw.githubusercontent.com/696963/${chunk.repo}/main/${chunk.path}`;
         const response = await fetch(url);
         if (!response.ok) {
-            throw new Error(`Failed to fetch chunk from GitHub: ${response.status}`);
+            throw new DriveError(`Gagal mengambil chunk dari GitHub: ${response.status}`, 'CHUNK_FETCH_FAILED', { chunk });
         }
         const text = await response.text();
 
         const doubleEncoded = this._extractDoubleEncoded(text);
         if (!doubleEncoded) {
-            throw new Error('No encoded data found in the GitHub file');
+            throw new DriveError('Tidak ada data terenkode dalam file GitHub', 'NO_ENCODED_DATA', { chunk });
         }
 
-        // Validasi dan decode doubleEncoded
         let encoded;
         try {
             encoded = atob(doubleEncoded);
         } catch (e) {
             console.error('Invalid base64 string:', doubleEncoded.substring(0, 100));
-            throw new Error('Corrupted chunk data: invalid base64');
+            throw new DriveError('Data chunk korup: base64 tidak valid', 'CORRUPTED_CHUNK', { chunk });
         }
 
         const ciphertext = this._decodeData(encoded, chunk.encoding);
@@ -469,35 +547,28 @@ export default class DriveManager {
         const hashArray = Array.from(new Uint8Array(hashBuffer));
         const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
         if (hashHex !== chunk.hash) {
-            console.warn(`Hash mismatch for chunk ${chunk.path}`);
+            console.warn(`Hash mismatch untuk chunk ${chunk.path}. Data mungkin korup.`);
         }
 
         return decompressed;
     }
 
     _extractDoubleEncoded(text) {
-        // Cari string dalam kutip ganda atau tunggal
         const doubleQuoted = text.match(/"((?:[^"\\]|\\.)*)"/g) || [];
         const singleQuoted = text.match(/'((?:[^'\\]|\\.)*)'/g) || [];
         const allQuoted = doubleQuoted.concat(singleQuoted);
 
         if (allQuoted.length > 0) {
-            // Ambil yang terpanjang
             const longest = allQuoted.reduce((a, b) => a.length > b.length ? a : b, '');
-            // Hapus tanda kutip pertama dan terakhir
             const quotedContent = longest.slice(1, -1);
-            // Unescape karakter escape JavaScript (misal \n, \", \\)
             try {
-                // JSON.parse akan menginterpretasi escape sequences dengan benar
                 return JSON.parse('"' + quotedContent + '"');
             } catch (e) {
                 console.warn('JSON parse failed, falling back to manual unescape', e);
-                // Fallback sederhana: ganti backslash + sesuatu dengan sesuatu (tidak sempurna)
                 return quotedContent.replace(/\\(.)/g, '$1');
             }
         }
 
-        // Fallback: cari rangkaian base64 panjang
         const base64Matches = text.match(/[A-Za-z0-9+/=]{50,}/g);
         if (base64Matches && base64Matches.length > 0) {
             return base64Matches.reduce((a, b) => a.length > b.length ? a : b, '');

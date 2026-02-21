@@ -27,7 +27,8 @@ import {
   query,
   where,
   orderBy,
-  limit,                 // <-- TAMBAHKAN
+  limit,      
+  increment,                     // <-- TAMBAHKAN
   serverTimestamp,
   doc,
   setDoc,
@@ -85,6 +86,7 @@ export {
   getDocs,
   query,
   where,
+  increment,
   orderBy,
   limit,                 // <-- EKSPOR
   serverTimestamp,
